@@ -1,7 +1,8 @@
 import abc
 import logging
-
 import six
+import traceback
+from concurrent.futures import ThreadPoolExecutor
 
 import pyalgotrade.broker
 from pyalgotrade.broker import backtesting
@@ -40,7 +41,11 @@ class BaseStrategy(object):
         self.__resampledBarFeeds = []
         self.__dispatcher = dispatcher.Dispatcher()
         self.__broker.getOrderUpdatedEvent().subscribe(self.__onOrderEvent)
-        self.__barFeed.getNewValuesEvent().subscribe(self.__onBars)
+
+        if self.isBacktest():
+            self.__barFeed.getNewValuesEvent().subscribe(self.__onBarsBacktest)
+        else:
+            self.__barFeed.getNewValuesEvent().subscribe(self.__onBars)
 
         # onStart will be called once all subjects are started.
         self.__dispatcher.getStartEvent().subscribe(self.onStart)
@@ -133,6 +138,9 @@ class BaseStrategy(object):
     def getCurrentDateTime(self):
         """Returns the :class:`datetime.datetime` for the current :class:`pyalgotrade.bar.Bars`."""
         return self.__barFeed.getCurrentDateTime()
+    
+    def isBacktest(self):
+        return self.getBroker().getType().lower() == "backtest"
 
     def marketOrder(self, instrument, quantity, onClose=False, goodTillCanceled=False, allOrNone=False):
         """Submits a market order.
@@ -483,7 +491,7 @@ class BaseStrategy(object):
 
             pos.onOrderEvent(orderEvent)
 
-    def __onBars(self, dateTime, bars):
+    def __onBarsBacktest(self, dateTime, bars):
         # THE ORDER HERE IS VERY IMPORTANT
 
         # 1: Let analyzers process bars.
@@ -494,6 +502,22 @@ class BaseStrategy(object):
             self.onBars(bars)
         except Exception as e:
             self.__logger.exception(f'Exception in __onBars. {e}')
+
+        # 3: Notify that the bars were processed.
+        self.__barsProcessedEvent.emit(self, bars)
+
+    def __onBars(self, dateTime, bars):
+        # THE ORDER HERE IS VERY IMPORTANT
+
+        # 1: Let analyzers process bars.
+        self.__notifyAnalyzers(lambda s: s.beforeOnBars(self, bars))
+
+        try:
+            with ThreadPoolExecutor() as executor:
+                executor.submit(self.onBars, bars)
+        except Exception as e:
+            self.__logger.error(f"❗️🆘 __onBars Error\n\n{str(e)}")
+            self.__logger.exception(traceback.format_exc())
 
         # 3: Notify that the bars were processed.
         self.__barsProcessedEvent.emit(self, bars)

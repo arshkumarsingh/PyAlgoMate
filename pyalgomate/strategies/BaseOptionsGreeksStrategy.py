@@ -98,9 +98,6 @@ class BaseOptionsGreeksStrategy(BaseStrategy):
         self.__resampledBarFeeds.append(ret)
         return ret
 
-    def isBacktest(self):
-        return self.getBroker().getType().lower() == "backtest"
-
     def buildOrdersFromActiveOrders(self):
         if not self.isBacktest():
             today = datetime.date.today()
