@@ -111,6 +111,7 @@ class LiveTradeFeed(BaseBarFeed):
         self.__stopped = False
         self.__orderBookUpdateEvent = observer.Event()
         self.__lastDataTime = None
+        self.__lastBars = dict()
 
     def getApi(self):
         return self.__api
@@ -185,11 +186,18 @@ class LiveTradeFeed(BaseBarFeed):
     def barsHaveAdjClose(self):
         return False
 
-    def getNextBars(self):
-        if self.__tradeBars.qsize() > 0:
-            return bar.Bars(self.__tradeBars.get())
+    def getLastBar(self, instrument) -> bar.Bar:
+        return self.__lastBars.get(instrument, None)
 
-        return None
+    def getNextBars(self):
+        bars = None
+        if self.__tradeBars.qsize() > 0:
+            bars = bar.Bars(self.__tradeBars.get())
+
+            for instrument in bars.getInstruments():
+                self.__lastBars[instrument] = bars[instrument]
+
+        return bars
 
     def peekDateTime(self):
         # Return None since this is a realtime subject.
