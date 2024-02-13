@@ -98,7 +98,6 @@ class LiveTradeFeed(BaseBarFeed):
 
     def __init__(self, api, tokenMappings, timeout=10, maxLen=None):
         super(LiveTradeFeed, self).__init__(bar.Frequency.TRADE, maxLen)
-        self.__tradeBars = queue.Queue()
         self.__channels = tokenMappings
         self.__api = api
         self.__timeout = timeout
@@ -112,6 +111,7 @@ class LiveTradeFeed(BaseBarFeed):
         self.__orderBookUpdateEvent = observer.Event()
         self.__lastDateTime = None
         self.__lastBars = dict()
+        self.__nextBars = queue.Queue()
 
     def getApi(self):
         return self.__api
@@ -157,30 +157,34 @@ class LiveTradeFeed(BaseBarFeed):
 
     def __dispatchImpl(self, eventFilter):
         ret = False
+        dateTime = None
+        barsDict = dict()
         try:
-            eventType, eventData = self.__thread.getQueue().get(
-                True, LiveTradeFeed.QUEUE_TIMEOUT)
-            if eventFilter is not None and eventType not in eventFilter:
-                return False
+            while self.__thread.getQueue().qsize() > 0:
+                eventType, eventData = self.__thread.getQueue().get_nowait()
+                if eventFilter is not None and eventType not in eventFilter:
+                    return False
+            
+                if eventType == wsclient.WebSocketClient.Event.TRADE:
+                    trade = eventData
+                    instrument = trade.getExtraColumns().get("Instrument")
+                    self.__lastBars[instrument] = trade
+                    self.__lastDateTime = trade.getDateTime()
 
-            ret = True
-            if eventType == wsclient.WebSocketClient.Event.TRADE:
-                self.__onTrade(eventData)
-            elif eventType == wsclient.WebSocketClient.Event.ORDER_BOOK_UPDATE:
-                self.__orderBookUpdateEvent.emit(eventData)
-            elif eventType == wsclient.WebSocketClient.Event.DISCONNECTED:
-                self.__onDisconnected()
-            else:
-                ret = False
-                logger.error(
-                    "Invalid event received to dispatch: %s - %s" % (eventType, eventData))
+                    if dateTime is None:
+                        dateTime = trade.getDateTime()
+                    
+                    if trade.getDateTime() != dateTime:
+                        break
+
+                    barsDict[instrument] = trade
+                
+            if len(barsDict):
+                ret = True
+                self.__nextBars.put(bar.Bars(barsDict))
         except six.moves.queue.Empty:
             pass
         return ret
-
-    def __onTrade(self, trade):
-        self.__tradeBars.put(trade)
-        self.__lastBars[trade.getExtraColumns().get("Instrument")] = trade
 
     def barsHaveAdjClose(self):
         return False
@@ -189,15 +193,10 @@ class LiveTradeFeed(BaseBarFeed):
         return self.__lastBars.get(instrument, None)
 
     def getNextBars(self):
-        barsDict = {}
-        while self.__tradeBars.qsize() > 0:
-            trade = self.__tradeBars.get()
-            instrument = trade.getExtraColumns().get("Instrument")
-            barsDict[instrument] = trade
+        if self.__nextBars.qsize() > 0:
+            return self.__nextBars.get()
 
-        bars = bar.Bars(barsDict)
-        self.__lastDateTime = bars.getDateTime()
-        return bars
+        return None
 
     def peekDateTime(self):
         # Return None since this is a realtime subject.

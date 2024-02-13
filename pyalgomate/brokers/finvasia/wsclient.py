@@ -201,7 +201,7 @@ class WebSocketClient:
         #     logger.debug(f"Current date time <{self.__currentDateTime}> for <{instrument}> is higher/equal than tick date time <{dateTime}>. Modifying tick time!")
         #     subscribeEvent.dateTime = datetime.datetime.now().replace(microsecond=0)
         # self.__currentDateTime = subscribeEvent.dateTime
-        subscribeEvent.dateTime = datetime.datetime.now()
+        subscribeEvent.dateTime = datetime.datetime.now().replace(microsecond=0)
         self.onTrade(subscribeEvent.TradeBar())
 
     def onOrderBookUpdate(self, message):
