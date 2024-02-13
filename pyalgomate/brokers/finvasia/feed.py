@@ -112,6 +112,7 @@ class LiveTradeFeed(BaseBarFeed):
         self.__orderBookUpdateEvent = observer.Event()
         self.__lastDataTime = None
         self.__lastBars = dict()
+        self.__lastBarTime = datetime.datetime.now()
 
     def getApi(self):
         return self.__api
@@ -180,8 +181,10 @@ class LiveTradeFeed(BaseBarFeed):
         return ret
 
     def __onTrade(self, trade):
-        self.__tradeBars.put(
-            {trade.getExtraColumns().get("Instrument"): trade})
+        instrument = trade.getExtraColumns().get("Instrument")
+        bars = bar.Bars({instrument: trade})
+        self.__tradeBars.put(bars)
+        self.__lastBars[instrument] = bars[instrument]
 
     def barsHaveAdjClose(self):
         return False
@@ -192,10 +195,7 @@ class LiveTradeFeed(BaseBarFeed):
     def getNextBars(self):
         bars = None
         if self.__tradeBars.qsize() > 0:
-            bars = bar.Bars(self.__tradeBars.get())
-
-            for instrument in bars.getInstruments():
-                self.__lastBars[instrument] = bars[instrument]
+            bars = self.__tradeBars.get()
 
         return bars
 
