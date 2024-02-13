@@ -110,9 +110,8 @@ class LiveTradeFeed(BaseBarFeed):
         self.__enableReconnection = True
         self.__stopped = False
         self.__orderBookUpdateEvent = observer.Event()
-        self.__lastDataTime = None
+        self.__lastDateTime = None
         self.__lastBars = dict()
-        self.__lastBarTime = datetime.datetime.now()
 
     def getApi(self):
         return self.__api
@@ -167,7 +166,6 @@ class LiveTradeFeed(BaseBarFeed):
             ret = True
             if eventType == wsclient.WebSocketClient.Event.TRADE:
                 self.__onTrade(eventData)
-                self.__lastDataTime = datetime.datetime.now()
             elif eventType == wsclient.WebSocketClient.Event.ORDER_BOOK_UPDATE:
                 self.__orderBookUpdateEvent.emit(eventData)
             elif eventType == wsclient.WebSocketClient.Event.DISCONNECTED:
@@ -181,10 +179,8 @@ class LiveTradeFeed(BaseBarFeed):
         return ret
 
     def __onTrade(self, trade):
-        instrument = trade.getExtraColumns().get("Instrument")
-        bars = bar.Bars({instrument: trade})
-        self.__tradeBars.put(bars)
-        self.__lastBars[instrument] = bars[instrument]
+        self.__tradeBars.put(trade)
+        self.__lastBars[trade.getExtraColumns().get("Instrument")] = trade
 
     def barsHaveAdjClose(self):
         return False
@@ -193,10 +189,14 @@ class LiveTradeFeed(BaseBarFeed):
         return self.__lastBars.get(instrument, None)
 
     def getNextBars(self):
-        bars = None
-        if self.__tradeBars.qsize() > 0:
-            bars = self.__tradeBars.get()
+        barsDict = {}
+        while self.__tradeBars.qsize() > 0:
+            trade = self.__tradeBars.get()
+            instrument = trade.getExtraColumns().get("Instrument")
+            barsDict[instrument] = trade
 
+        bars = bar.Bars(barsDict)
+        self.__lastDateTime = bars.getDateTime()
         return bars
 
     def peekDateTime(self):
@@ -248,12 +248,12 @@ class LiveTradeFeed(BaseBarFeed):
         return self.__orderBookUpdateEvent
 
     def getLastUpdatedDateTime(self):
-        return self.__lastDataTime
+        return self.__lastDateTime
 
     def isDataFeedAlive(self, heartBeatInterval=5):
-        if self.__lastDataTime is None:
+        if self.__lastDateTime is None:
             return False
 
         currentDateTime = datetime.datetime.now()
-        timeSinceLastDateTime = currentDateTime - self.__lastDataTime
+        timeSinceLastDateTime = currentDateTime - self.__lastDateTime
         return timeSinceLastDateTime.total_seconds() <= heartBeatInterval
