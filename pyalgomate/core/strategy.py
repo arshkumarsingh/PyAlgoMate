@@ -2,7 +2,6 @@ import abc
 import logging
 import six
 import traceback
-from concurrent.futures import ThreadPoolExecutor
 
 import pyalgotrade.broker
 from pyalgotrade.broker import backtesting
@@ -10,9 +9,8 @@ from pyalgotrade import observer
 from pyalgotrade import dispatcher
 import pyalgotrade.strategy.position
 from pyalgotrade import logger
-from pyalgotrade.barfeed import resampled
 from pyalgomate.barfeed import BaseBarFeed
-
+from pyalgomate.core import resampled
 
 @six.add_metaclass(abc.ABCMeta)
 class BaseStrategy(object):
@@ -42,10 +40,7 @@ class BaseStrategy(object):
         self.__dispatcher = dispatcher.Dispatcher()
         self.__broker.getOrderUpdatedEvent().subscribe(self.__onOrderEvent)
 
-        if self.isBacktest():
-            self.__barFeed.getNewValuesEvent().subscribe(self.__onBarsBacktest)
-        else:
-            self.__barFeed.getNewValuesEvent().subscribe(self.__onBars)
+        self.__barFeed.getNewValuesEvent().subscribe(self.__onBars)
 
         # onStart will be called once all subjects are started.
         self.__dispatcher.getStartEvent().subscribe(self.onStart)
@@ -491,7 +486,7 @@ class BaseStrategy(object):
 
             pos.onOrderEvent(orderEvent)
 
-    def __onBarsBacktest(self, dateTime, bars):
+    def __onBars(self, dateTime, bars):
         # THE ORDER HERE IS VERY IMPORTANT
 
         # 1: Let analyzers process bars.
@@ -500,24 +495,11 @@ class BaseStrategy(object):
         try:
             # 2: Let the strategy process current bars and submit orders.
             self.onBars(bars)
+
+            for resampledBarFeed in self.__resampledBarFeeds:
+                resampledBarFeed.addBars(dateTime, bars)
         except Exception as e:
             self.__logger.exception(f'Exception in __onBars. {e}')
-
-        # 3: Notify that the bars were processed.
-        self.__barsProcessedEvent.emit(self, bars)
-
-    def __onBars(self, dateTime, bars):
-        # THE ORDER HERE IS VERY IMPORTANT
-
-        # 1: Let analyzers process bars.
-        self.__notifyAnalyzers(lambda s: s.beforeOnBars(self, bars))
-
-        try:
-            with ThreadPoolExecutor() as executor:
-                executor.submit(self.onBars, bars)
-        except Exception as e:
-            self.__logger.error(f"❗️🆘 __onBars Error\n\n{str(e)}")
-            self.__logger.exception(traceback.format_exc())
 
         # 3: Notify that the bars were processed.
         self.__barsProcessedEvent.emit(self, bars)
@@ -570,9 +552,7 @@ class BaseStrategy(object):
         :param callback: A function similar to onBars that will be called when new bars are available.
         :rtype: :class:`pyalgotrade.barfeed.BaseBarFeed`.
         """
-        ret = resampled.ResampledBarFeed(self.getFeed(), frequency)
-        ret.getNewValuesEvent().subscribe(lambda dt, bars: callback(bars))
-        self.getDispatcher().addSubject(ret)
+        ret = resampled.ResampledBars(self.getFeed(), frequency, callback)
         self.__resampledBarFeeds.append(ret)
         return ret
 

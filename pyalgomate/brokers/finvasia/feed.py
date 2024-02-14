@@ -2,249 +2,143 @@
 .. moduleauthor:: Nagaraju Gunda
 """
 
+import time
 import datetime
 import logging
-import six
+import threading
 import queue
 
-import abc
-
-from pyalgotrade.dataseries import bards
-from pyalgotrade import feed
-from pyalgotrade import dispatchprio
+from NorenRestApiPy.NorenApi import NorenApi
 
 from pyalgotrade import bar
 from pyalgomate.barfeed import BaseBarFeed
-from pyalgotrade import observer
-from pyalgomate.brokers.finvasia import wsclient
 
 logger = logging.getLogger(__name__)
 
+class SubscribeEvent(object):
+    # t	tk	‘tk’ represents touchline acknowledgement
+    # e	NSE, BSE, NFO ..	Exchange name
+    # tk	22	Scrip Token
+    # pp	2 for NSE, BSE & 4 for CDS USDINR	Price precision
+    # ts		Trading Symbol
+    # ti		Tick size
+    # ls		Lot size
+    # lp		LTP
+    # pc		Percentage change
+    # v		volume
+    # o		Open price
+    # h		High price
+    # l		Low price
+    # c		Close price
+    # ap		Average trade price
+    # oi		Open interest
+    # poi		Previous day closing Open Interest
+    # toi		Total open interest for underlying
+    # bq1		Best Buy Quantity 1
+    # bp1		Best Buy Price 1
+    # sq1		Best Sell Quantity 1
+    # sp1		Best Sell Price 1
 
-class TradeBar(bar.Bar):
-    def __init__(self, trade):
-        self.__dateTime = trade.getDateTime()
-        self.__trade = trade
+    def __init__(self, eventDict):
+        self.__eventDict = eventDict
+        self.__datetime = None
 
-    def getInstrument(self):
-        return self.__trade.getExtraColumns().get("instrument")
+    @property
+    def exchange(self):
+        return self.__eventDict["e"]
 
-    def setUseAdjustedValue(self, useAdjusted):
-        if useAdjusted:
-            raise Exception("Adjusted close is not available")
+    @property
+    def scriptToken(self):
+        return self.__eventDict["tk"]
 
-    def getTrade(self):
-        return self.__trade
+    @property
+    def tradingSymbol(self):
+        return self.__eventDict["ts"]
 
-    def getTradeId(self):
-        return self.__trade.getId()
+    @property
+    def dateTime(self):
+        if self.__datetime is None:
+            self.__datetime = datetime.datetime.fromtimestamp(int(self.__eventDict['ft'])) if self.__eventDict.get(
+                'ft', None) is not None else datetime.datetime.now()
 
-    def getFrequency(self):
-        return bar.Frequency.TRADE
+        return self.__datetime
 
-    def getDateTime(self):
-        return self.__dateTime
+    @dateTime.setter
+    def dateTime(self, value):
+        self.__datetime = value
 
-    def getOpen(self, adjusted=False):
-        return self.__trade.getPrice()
+    @property
+    def tickDateTime(self):
+        return datetime.datetime.fromtimestamp(int(self.__eventDict['ft'])) if self.__eventDict.get(
+            'ft', None) is not None else datetime.datetime.now()
 
-    def getHigh(self, adjusted=False):
-        return self.__trade.getPrice()
+    @property
+    def price(self): return float(self.__eventDict.get('lp', 0))
 
-    def getLow(self, adjusted=False):
-        return self.__trade.getPrice()
+    @property
+    def volume(self): return float(self.__eventDict.get('v', 0))
 
-    def getClose(self, adjusted=False):
-        return self.__trade.getPrice()
+    @property
+    def openInterest(self): return float(self.__eventDict.get('oi', 0))
 
-    def getVolume(self):
-        return self.__trade.getAmount()
+    @property
+    def seq(self): return int(self.dateTime())
 
-    def getAdjClose(self):
-        return None
+    @property
+    def instrument(self): return f"{self.exchange}|{self.tradingSymbol}"
 
-    def getTypicalPrice(self):
-        return self.__trade.getPrice()
+    def getBar(self):
+        open = high = low = close = self.price
 
-    def getPrice(self):
-        return self.__trade.getPrice()
+        return bar.BasicBar(self.dateTime,
+                            open,
+                            high,
+                            low,
+                            close,
+                            self.volume,
+                            None,
+                            bar.Frequency.TRADE,
+                            {
+                                "Instrument": self.instrument,
+                                "Open Interest": self.openInterest,
+                                "Date/Time": self.tickDateTime
+                            })
 
-    def getUseAdjValue(self):
-        return False
-
-    def isBuy(self):
-        return self.__trade.isBuy()
-
-    def isSell(self):
-        return not self.__trade.isBuy()
 
 class LiveTradeFeed(BaseBarFeed):
-
-    """A real-time BarFeed that builds bars from live trades.
-
-    :param instruments: A list of currency pairs.
-    :type instruments: list of :class:`pyalgotrade.instrument.Instrument` or a string formatted like
-        QUOTE_SYMBOL/PRICE_CURRENCY..
-    :param maxLen: The maximum number of values that the :class:`pyalgotrade.dataseries.bards.BarDataSeries` will hold.
-        Once a bounded length is full, when new items are added, a corresponding number of items are discarded
-        from the opposite end. If None then dataseries.DEFAULT_MAX_LEN is used.
-    :type maxLen: int.
-
-    .. note::
-        Note that a Bar will be created for every trade, so open, high, low and close values will all be the same.
-    """
-
-    QUEUE_TIMEOUT = 0.01
-
     def __init__(self, api, tokenMappings, timeout=10, maxLen=None):
         super(LiveTradeFeed, self).__init__(bar.Frequency.TRADE, maxLen)
-        self.__channels = tokenMappings
-        self.__api = api
+        self.__api:NorenApi = api
+        self.__tokenMappings = tokenMappings
         self.__timeout = timeout
-
-        for key, value in tokenMappings.items():
-            self.registerDataSeries(value)
-
-        self.__thread = None
-        self.__enableReconnection = True
-        self.__stopped = False
-        self.__orderBookUpdateEvent = observer.Event()
+        
         self.__lastDateTime = None
         self.__lastBars = dict()
         self.__nextBars = queue.Queue()
-
-    def getApi(self):
-        return self.__api
-
-    # Factory method for testing purposes.
-    def buildWebSocketClientThread(self):
-        return wsclient.WebSocketClientThread(self.__api, self.__channels)
+        self.__tradeBars = queue.Queue()
+        
+        self.__wsThread = None
+        self.__barEmitterThread = None
+        self.__initialized = threading.Event()
+        self.__stopped = False
+        self.barEmitterFrequency = 0.5
+        self.__pending_subscriptions = list()
 
     def getCurrentDateTime(self):
         return datetime.datetime.now()
 
-    def enableReconection(self, enableReconnection):
-        self.__enableReconnection = enableReconnection
-
-    def __initializeClient(self):
-        logger.info("Initializing websocket client")
-        initialized = False
-        try:
-            # Start the thread that runs the client.
-            self.__thread = self.buildWebSocketClientThread()
-            self.__thread.start()
-        except Exception as e:
-            logger.error("Error connecting : %s" % str(e))
-
-        logger.info("Waiting for websocket initialization to complete")
-        while not initialized and not self.__stopped:
-            initialized = self.__thread.waitInitialized(self.__timeout)
-
-        if initialized:
-            logger.info("Initialization completed")
-        else:
-            logger.error("Initialization failed")
-        return initialized
-
-    def __onDisconnected(self):
-        if self.__enableReconnection:
-            logger.info("Reconnecting")
-            while not self.__stopped and not self.__initializeClient():
-                pass
-        elif not self.__stopped:
-            logger.info("Stopping")
-            self.__stopped = True
-
-    def __dispatchImpl(self, eventFilter):
-        ret = False
-        dateTime = None
-        barsDict = dict()
-        try:
-            while self.__thread.getQueue().qsize() > 0:
-                eventType, eventData = self.__thread.getQueue().get_nowait()
-                if eventFilter is not None and eventType not in eventFilter:
-                    return False
-            
-                if eventType == wsclient.WebSocketClient.Event.TRADE:
-                    trade = eventData
-                    instrument = trade.getExtraColumns().get("Instrument")
-                    self.__lastBars[instrument] = trade
-                    self.__lastDateTime = trade.getDateTime()
-
-                    if dateTime is None:
-                        dateTime = trade.getDateTime()
-                    
-                    if trade.getDateTime() != dateTime:
-                        break
-
-                    barsDict[instrument] = trade
-                
-            if len(barsDict):
-                ret = True
-                self.__nextBars.put(bar.Bars(barsDict))
-        except six.moves.queue.Empty:
-            pass
-        return ret
+    def peekDateTime(self):
+        # Return None since this is a realtime subject.
+        return None
 
     def barsHaveAdjClose(self):
         return False
-
-    def getLastBar(self, instrument) -> bar.Bar:
-        return self.__lastBars.get(instrument, None)
 
     def getNextBars(self):
         if self.__nextBars.qsize() > 0:
             return self.__nextBars.get()
 
         return None
-
-    def peekDateTime(self):
-        # Return None since this is a realtime subject.
-        return None
-
-    # This may raise.
-    def start(self):
-        if self.__thread is not None:
-            logger.info("Already running!")
-            return
-        
-        super(LiveTradeFeed, self).start()
-        if not self.__initializeClient():
-            self.__stopped = True
-            raise Exception("Initialization failed")
-
-    def dispatch(self):
-        # Note that we may return True even if we didn't dispatch any Bar
-        # event.
-        ret = False
-        if self.__dispatchImpl(None):
-            ret = True
-        if super(LiveTradeFeed, self).dispatch():
-            ret = True
-        return ret
-
-    # This should not raise.
-    def stop(self):
-        pass
-
-    # This should not raise.
-    def join(self):
-        if self.__thread is not None:
-            self.__thread.join()
-
-    def eof(self):
-        return self.__stopped
-
-    def getOrderBookUpdateEvent(self):
-        """
-        Returns the event that will be emitted when the orderbook gets updated.
-
-        Eventh handlers should receive one parameter:
-         1. A :class:`pyalgotrade.bitstamp.wsclient.OrderBookUpdate` instance.
-
-        :rtype: :class:`pyalgotrade.observer.Event`.
-        """
-        return self.__orderBookUpdateEvent
 
     def getLastUpdatedDateTime(self):
         return self.__lastDateTime
@@ -256,3 +150,147 @@ class LiveTradeFeed(BaseBarFeed):
         currentDateTime = datetime.datetime.now()
         timeSinceLastDateTime = currentDateTime - self.__lastDateTime
         return timeSinceLastDateTime.total_seconds() <= heartBeatInterval
+
+    def getApi(self):
+        return self.__api
+    
+    def getLastBar(self, instrument) -> bar.Bar:
+        return self.__lastBars.get(instrument, None)
+    
+    def start(self):
+        if self.__wsThread is not None:
+            logger.info("Already running!")
+            return
+        
+        #super(LiveTradeFeed, self).start()
+        self.__wsThread = threading.Thread(target=self.__startWebsocket)
+        self.__wsThread.start()
+        self.__barEmitterThread = threading.Thread(target=self.__barEmitter)
+        self.__barEmitterThread.start()
+
+        if not self.__initializeClient():
+            self.__stopped = True
+            raise Exception("Initialization failed")
+    
+    def stop(self):
+        if self.__wsThread is not None:
+            self.__api.close_websocket()
+            self.__stopped = True
+            self.join()
+    
+    def join(self):
+        if self.__wsThread is not None:
+            self.__wsThread.join()
+            self.__wsThread = None
+        if self.__barEmitterThread is not None:
+            self.__barEmitterThread.join()
+            self.__barEmitterThread = None
+
+    def eof(self):
+        return self.__stopped
+    
+    def dispatch(self):
+        pass
+
+    def __initializeClient(self):
+        initialized = False
+        logger.info("Waiting for websocket initialization to complete")
+
+        while not initialized and not self.__stopped:
+            logger.info(f"Waiting for WebSocketClient waitInitialized with timeout of {self.__timeout}")
+            initialized = self.__initialized.wait(self.__timeout)
+
+        if initialized:
+            logger.info("Initialization completed")
+        else:
+            logger.error("Initialization failed")
+
+        return initialized
+    
+    def __barEmitter(self):
+        while not self.__stopped:
+            dateTime = None
+            barsDict = dict()
+            while self.__tradeBars.qsize() > 0:
+                try:
+                    tradeBar:bar.BasicBar = self.__tradeBars.get_nowait()
+                    instrument = tradeBar.getExtraColumns().get("Instrument")
+
+                    if dateTime is None:
+                        dateTime = tradeBar.getDateTime()
+                        
+                    if tradeBar.getDateTime() != dateTime:
+                        break
+
+                    barsDict[instrument] = tradeBar
+                except Exception as e:
+                    pass
+                finally:
+                    if len(barsDict):
+                        self.__nextBars.put(bar.Bars(barsDict))
+                    dateTime, values = self.getNextValuesAndUpdateDS()
+                    if dateTime is not None:
+                        self.__lastDateTime = dateTime
+                        self.getNewValuesEvent().emit(dateTime, values)
+
+            time.sleep(self.barEmitterFrequency)
+
+    def __startWebsocket(self):
+        self.__api.start_websocket(order_update_callback=self.onOrderBookUpdate,
+                                   subscribe_callback=self.onQuoteUpdate,
+                                   socket_open_callback=self.onOpened,
+                                   socket_close_callback=self.onClosed,
+                                   socket_error_callback=self.onError)
+
+
+    def onOrderBookUpdate(self, message):
+        pass
+
+    def onUnknownEvent(self, event):
+        logger.warning("Unknown event: %s." % event)
+    
+    def __onSubscriptionSucceeded(self, event):
+        logger.info(f"Subscription succeeded for <{event.exchange}|{event.tradingSymbol}>")
+
+        self.__pending_subscriptions.remove(f"{event.exchange}|{event.scriptToken}")
+
+        if not self.__pending_subscriptions:
+            self.__initialized.set()
+    
+    def onTrade(self, tradeBar: bar.BasicBar):
+        self.__tradeBars.put(tradeBar)
+        instrument = tradeBar.getExtraColumns().get("Instrument")
+        self.__lastBars[instrument] = tradeBar
+
+    def onQuoteUpdate(self, message):
+        logger.debug(message)
+
+        field = message.get("t")
+        message["ts"] = self.__tokenMappings[f"{message['e']}|{message['tk']}"].split('|')[
+            1]
+        # t='tk' is sent once on subscription for each instrument.
+        # this will have all the fields with the most recent value thereon t='tf' is sent for fields that have changed.
+        subscribeEvent = SubscribeEvent(message)
+
+        if field not in ["tf", "tk"]:
+            self.onUnknownEvent(subscribeEvent)
+            return
+
+        if field == "tk":
+            self.__onSubscriptionSucceeded(subscribeEvent)
+
+        subscribeEvent.dateTime = datetime.datetime.now().replace(microsecond=0)
+        self.onTrade(subscribeEvent.getBar())
+        
+    def onOpened(self):
+        logger.info("Websocket connected")
+        self.__pending_subscriptions = list(self.__tokenMappings.keys())
+        for channel in self.__pending_subscriptions:
+            logger.info("Subscribing to channel %s." % channel)
+            self.__api.subscribe(channel)
+    
+    def onClosed(self):
+        logger.info("Websocket disconnected")
+
+    def onError(self, exception):
+        logger.error("Error: %s." % exception)
