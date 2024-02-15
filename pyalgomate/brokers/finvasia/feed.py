@@ -6,16 +6,17 @@ import time
 import datetime
 import logging
 import threading
-import queue
+import zmq
 
 from NorenRestApiPy.NorenApi import NorenApi
 
 from pyalgotrade import bar
 from pyalgomate.barfeed import BaseBarFeed
+from pyalgomate.barfeed.BasicBarEx import BasicBarEx
 
 logger = logging.getLogger(__name__)
 
-class SubscribeEvent(object):
+class QuoteMessage(object):
     # t	tk	‘tk’ represents touchline acknowledgement
     # e	NSE, BSE, NFO ..	Exchange name
     # tk	22	Scrip Token
@@ -39,9 +40,17 @@ class SubscribeEvent(object):
     # sq1		Best Sell Quantity 1
     # sp1		Best Sell Price 1
 
-    def __init__(self, eventDict):
+    def __init__(self, eventDict, tokenMappings):
         self.__eventDict = eventDict
+        self.__tokenMappings = tokenMappings
         self.__datetime = None
+
+    def __str__(self):
+        return f'{self.__eventDict}'
+
+    @property
+    def field(self):
+        return self.__eventDict["t"]
 
     @property
     def exchange(self):
@@ -50,10 +59,6 @@ class SubscribeEvent(object):
     @property
     def scriptToken(self):
         return self.__eventDict["tk"]
-
-    @property
-    def tradingSymbol(self):
-        return self.__eventDict["ts"]
 
     @property
     def dateTime(self):
@@ -68,11 +73,6 @@ class SubscribeEvent(object):
         self.__datetime = value
 
     @property
-    def tickDateTime(self):
-        return datetime.datetime.fromtimestamp(int(self.__eventDict['ft'])) if self.__eventDict.get(
-            'ft', None) is not None else datetime.datetime.now()
-
-    @property
     def price(self): return float(self.__eventDict.get('lp', 0))
 
     @property
@@ -85,24 +85,24 @@ class SubscribeEvent(object):
     def seq(self): return int(self.dateTime())
 
     @property
-    def instrument(self): return f"{self.exchange}|{self.tradingSymbol}"
+    def instrument(self): return f"{self.exchange}|{self.__tokenMappings[f'{self.exchange}|{self.scriptToken}'].split('|')[1]}"
 
-    def getBar(self):
+    def getBar(self) -> BasicBarEx:
         open = high = low = close = self.price
 
-        return bar.BasicBar(self.dateTime,
-                            open,
-                            high,
-                            low,
-                            close,
-                            self.volume,
-                            None,
-                            bar.Frequency.TRADE,
-                            {
-                                "Instrument": self.instrument,
-                                "Open Interest": self.openInterest,
-                                "Date/Time": self.tickDateTime
-                            })
+        return BasicBarEx(self.dateTime,                
+                    open,
+                    high,
+                    low,
+                    close,
+                    self.volume,
+                    None,
+                    bar.Frequency.TRADE,
+                    {
+                        "Instrument": self.instrument,
+                        "Open Interest": self.openInterest
+                    }
+                )
 
 
 class LiveTradeFeed(BaseBarFeed):
@@ -111,20 +111,21 @@ class LiveTradeFeed(BaseBarFeed):
         self.__api:NorenApi = api
         self.__tokenMappings = tokenMappings
         self.__timeout = timeout
+        self.__connectionOpened = threading.Event()
         
         for key, value in tokenMappings.items():
             self.registerDataSeries(value)
 
         self.__lastDateTime = None
         self.__lastBars = dict()
-        self.__tradeBars = queue.Queue()
         
         self.__wsThread = None
-        self.__barEmitterThread = None
-        self.__initialized = threading.Event()
         self.__stopped = False
-        self.barEmitterFrequency = 0.5
         self.__pending_subscriptions = list()
+
+        self.__zmq_context = zmq.Context()
+        self.__zmq_publisher = self.__zmq_context.socket(zmq.PUB)
+        self.__zmq_publisher.bind(f"tcp://127.0.0.1:5555")
 
     def getCurrentDateTime(self):
         return datetime.datetime.now()
@@ -161,17 +162,33 @@ class LiveTradeFeed(BaseBarFeed):
             logger.info("Already running!")
             return
         
-        #super(LiveTradeFeed, self).start()
+        super(LiveTradeFeed, self).start()
         self.__wsThread = threading.Thread(target=self.__startWebsocket)
         self.__wsThread.start()
-        self.__barEmitterThread = threading.Thread(target=self.__barEmitter)
-        self.__barEmitterThread.start()
 
-        if not self.__initializeClient():
-            self.__stopped = True
-            raise Exception("Initialization failed")
-    
+        logger.info('Waiting for connection to be opened')
+        opened = self.__connectionOpened.wait(self.__timeout)
+
+        if opened:
+            logger.info('Connection opened. Waiting for subscriptions to complete')
+        else:
+            logger.error(f'Connection not opened in {self.__timeout} secs. Stopping the feed')
+            self.stop()
+            return
+
+        for _ in range(self.__timeout):
+            if {self.__tokenMappings[pendingSubscription]
+                for pendingSubscription in self.__pending_subscriptions
+                }.issubset(self.__lastBars.keys()):
+                self.__pending_subscriptions.clear()
+                logger.info("Initialization completed")
+                break
+            time.sleep(1)
+
     def stop(self):
+        self.__zmq_publisher.close()
+        self.__zmq_context.term()
+
         if self.__wsThread is not None:
             self.__api.close_websocket()
             self.__stopped = True
@@ -181,9 +198,6 @@ class LiveTradeFeed(BaseBarFeed):
         if self.__wsThread is not None:
             self.__wsThread.join()
             self.__wsThread = None
-        if self.__barEmitterThread is not None:
-            self.__barEmitterThread.join()
-            self.__barEmitterThread = None
 
     def eof(self):
         return self.__stopped
@@ -191,52 +205,6 @@ class LiveTradeFeed(BaseBarFeed):
     def dispatch(self):
         pass
 
-    def __initializeClient(self):
-        initialized = False
-        logger.info("Waiting for websocket initialization to complete")
-
-        while not initialized and not self.__stopped:
-            logger.info(f"Waiting for WebSocketClient waitInitialized with timeout of {self.__timeout}")
-            initialized = self.__initialized.wait(self.__timeout)
-
-        if initialized:
-            logger.info("Initialization completed")
-        else:
-            logger.error("Initialization failed")
-
-        return initialized
-    
-    def getNextValues(self):
-        dateTime = None
-        barsDict = dict()
-        while self.__tradeBars.qsize() > 0:
-            try:
-                tradeBar:bar.BasicBar = self.__tradeBars.get_nowait()
-                instrument = tradeBar.getExtraColumns().get("Instrument")
-
-                if dateTime is None:
-                    dateTime = tradeBar.getDateTime()
-                    
-                if tradeBar.getDateTime() != dateTime:
-                    break
-
-                barsDict[instrument] = tradeBar
-            except Exception as e:
-                pass
-        
-        if len(barsDict):
-            return (dateTime, bar.Bars(barsDict))
-        
-        return (None, None)
-
-    def __barEmitter(self):
-        while not self.__stopped:
-            dateTime, values = self.getNextValuesAndUpdateDS()
-            if dateTime is not None:
-                self.getNewValuesEvent().emit(dateTime, values)
-                self.__lastDateTime = dateTime
-
-            time.sleep(self.barEmitterFrequency)
 
     def __startWebsocket(self):
         self.__api.start_websocket(order_update_callback=self.onOrderBookUpdate,
@@ -251,47 +219,23 @@ class LiveTradeFeed(BaseBarFeed):
 
     def onUnknownEvent(self, event):
         logger.warning("Unknown event: %s." % event)
-    
-    def __onSubscriptionSucceeded(self, event):
-        logger.info(f"Subscription succeeded for <{event.exchange}|{event.tradingSymbol}>")
-
-        self.__pending_subscriptions.remove(f"{event.exchange}|{event.scriptToken}")
-
-        if not self.__pending_subscriptions:
-            self.__initialized.set()
-    
-    def onTrade(self, tradeBar: bar.BasicBar):
-        self.__tradeBars.put(tradeBar)
-        instrument = tradeBar.getExtraColumns().get("Instrument")
-        self.__lastBars[instrument] = tradeBar
 
     def onQuoteUpdate(self, message):
         logger.debug(message)
+        quoteMessage = QuoteMessage(message, self.__tokenMappings)
+        tradeBar = quoteMessage.getBar()
+        self.__lastBars[quoteMessage.instrument] = tradeBar
+        self.__zmq_publisher.send_json(tradeBar.to_json())
+        self.__lastDateTime = tradeBar.getDateTime()
 
-        field = message.get("t")
-        message["ts"] = self.__tokenMappings[f"{message['e']}|{message['tk']}"].split('|')[
-            1]
-        # t='tk' is sent once on subscription for each instrument.
-        # this will have all the fields with the most recent value thereon t='tf' is sent for fields that have changed.
-        subscribeEvent = SubscribeEvent(message)
-
-        if field not in ["tf", "tk"]:
-            self.onUnknownEvent(subscribeEvent)
-            return
-
-        if field == "tk":
-            self.__onSubscriptionSucceeded(subscribeEvent)
-
-        subscribeEvent.dateTime = datetime.datetime.now().replace(microsecond=0)
-        self.onTrade(subscribeEvent.getBar())
-        
     def onOpened(self):
         logger.info("Websocket connected")
         self.__pending_subscriptions = list(self.__tokenMappings.keys())
         for channel in self.__pending_subscriptions:
-            logger.info("Subscribing to channel %s." % channel)
+            logger.info(f"Subscribing to channel {channel} - Instrument {self.__tokenMappings[channel]}")
             self.__api.subscribe(channel)
-    
+        self.__connectionOpened.set()
+
     def onClosed(self):
         logger.info("Websocket disconnected")
 
