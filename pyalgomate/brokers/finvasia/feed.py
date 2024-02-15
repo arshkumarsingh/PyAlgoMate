@@ -114,7 +114,6 @@ class LiveTradeFeed(BaseBarFeed):
         
         self.__lastDateTime = None
         self.__lastBars = dict()
-        self.__nextBars = queue.Queue()
         self.__tradeBars = queue.Queue()
         
         self.__wsThread = None
@@ -135,9 +134,6 @@ class LiveTradeFeed(BaseBarFeed):
         return False
 
     def getNextBars(self):
-        if self.__nextBars.qsize() > 0:
-            return self.__nextBars.get()
-
         return None
 
     def getLastUpdatedDateTime(self):
@@ -207,31 +203,35 @@ class LiveTradeFeed(BaseBarFeed):
 
         return initialized
     
+    def getNextValues(self):
+        dateTime = None
+        barsDict = dict()
+        while self.__tradeBars.qsize() > 0:
+            try:
+                tradeBar:bar.BasicBar = self.__tradeBars.get_nowait()
+                instrument = tradeBar.getExtraColumns().get("Instrument")
+
+                if dateTime is None:
+                    dateTime = tradeBar.getDateTime()
+                    
+                if tradeBar.getDateTime() != dateTime:
+                    break
+
+                barsDict[instrument] = tradeBar
+            except Exception as e:
+                pass
+        
+        if len(barsDict):
+            return (dateTime, bar.Bars(barsDict))
+        
+        return (None, None)
+
     def __barEmitter(self):
         while not self.__stopped:
-            dateTime = None
-            barsDict = dict()
-            while self.__tradeBars.qsize() > 0:
-                try:
-                    tradeBar:bar.BasicBar = self.__tradeBars.get_nowait()
-                    instrument = tradeBar.getExtraColumns().get("Instrument")
-
-                    if dateTime is None:
-                        dateTime = tradeBar.getDateTime()
-                        
-                    if tradeBar.getDateTime() != dateTime:
-                        break
-
-                    barsDict[instrument] = tradeBar
-                except Exception as e:
-                    pass
-                finally:
-                    if len(barsDict):
-                        self.__nextBars.put(bar.Bars(barsDict))
-                    dateTime, values = self.getNextValuesAndUpdateDS()
-                    if dateTime is not None:
-                        self.__lastDateTime = dateTime
-                        self.getNewValuesEvent().emit(dateTime, values)
+            dateTime, values = self.getNextValuesAndUpdateDS()
+            if dateTime is not None:
+                self.getNewValuesEvent().emit(dateTime, values)
+                self.__lastDateTime = dateTime
 
             time.sleep(self.barEmitterFrequency)
 
