@@ -112,6 +112,9 @@ class LiveTradeFeed(BaseBarFeed):
         self.__tokenMappings = tokenMappings
         self.__timeout = timeout
         
+        for key, value in tokenMappings.items():
+            self.registerDataSeries(value)
+
         self.__lastDateTime = None
         self.__lastBars = dict()
         self.__tradeBars = queue.Queue()
