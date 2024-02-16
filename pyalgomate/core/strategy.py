@@ -572,9 +572,13 @@ class BaseStrategy(object):
 
     def __subscribeFeed(self):
         while not self.__stopped:
-            bars = self.getFeed().getNextBars()
-            if bars:
-                self.__onBars(bars.getDateTime(), bars)
+            try:
+                bars = self.getFeed().getNextBars()
+                if bars:
+                    self.__onBars(bars.getDateTime(), bars)
+            except Exception as e:
+                self.getLogger().exception(e)
+                
 
 class BacktestingStrategy(BaseStrategy):
     """Base class for backtesting strategies.

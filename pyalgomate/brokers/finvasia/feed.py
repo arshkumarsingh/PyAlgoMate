@@ -128,15 +128,16 @@ class LiveTradeFeed(BaseBarFeed):
 
     def getNextBars(self):
         groupedQuoteMessages = defaultdict(dict)
-        for lastBar in self.__lastBars.values():
-            quoteMessage = QuoteMessage(lastBar, self.__tokenMappings)
-            groupedQuoteMessages[quoteMessage.dateTime][quoteMessage.instrument] = quoteMessage.getBar()
+        for lastBar in self.__lastBars.copy().values():
+            quoteBar = QuoteMessage(lastBar, self.__tokenMappings).getBar()
+
+            groupedQuoteMessages[quoteBar.getDateTime()][quoteBar.getInstrument()] = quoteBar
 
         latestDateTime = max(groupedQuoteMessages.keys(), default=None)
         return bar.Bars(groupedQuoteMessages[latestDateTime]) if latestDateTime is not None else None
 
     def getLastUpdatedDateTime(self):
-        return max((QuoteMessage(lastBar, self.__tokenMappings).dateTime for lastBar in self.__lastBars.values()), default=None)
+        return max((QuoteMessage(lastBar, self.__tokenMappings).dateTime for lastBar in self.__lastBars.copy().values()), default=None)
 
     def isDataFeedAlive(self, heartBeatInterval=5):
         if self.getLastUpdatedDateTime() is None:
