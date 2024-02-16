@@ -53,9 +53,8 @@ class BaseStrategy(object):
         self.__dispatcher.addSubject(self.__broker)
         self.__feedThread = None
         self.__stopped = False
-        if self.isBacktest():
-            self.__dispatcher.addSubject(self.__barFeed)
-        else:
+        self.__dispatcher.addSubject(self.__barFeed)
+        if not self.isBacktest():
             self.__feedThread = threading.Thread(target=self.__subscribeFeed)
 
         # Initialize logging.
@@ -575,10 +574,10 @@ class BaseStrategy(object):
             try:
                 bars = self.getFeed().getNextBars()
                 if bars:
+                    self.getFeed().getNewValuesEvent().emit(bars.getDateTime(), bars)
                     self.__onBars(bars.getDateTime(), bars)
             except Exception as e:
                 self.getLogger().exception(e)
-                
 
 class BacktestingStrategy(BaseStrategy):
     """Base class for backtesting strategies.
