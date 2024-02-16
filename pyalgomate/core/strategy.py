@@ -53,9 +53,10 @@ class BaseStrategy(object):
         self.__dispatcher.addSubject(self.__broker)
         self.__feedThread = None
         self.__stopped = False
-        self.__dispatcher.addSubject(self.__barFeed)
-        if not self.isBacktest():
+        if self.isLive():
             self.__feedThread = threading.Thread(target=self.__subscribeFeed)
+        else:
+            self.__dispatcher.addSubject(self.__barFeed)
 
         # Initialize logging.
         self.__logger = logger.getLogger(BaseStrategy.LOGGER_NAME)
@@ -143,6 +144,12 @@ class BaseStrategy(object):
     
     def isBacktest(self):
         return self.getBroker().getType().lower() == "backtest"
+    
+    def isPaper(self):
+        return self.getBroker().getType().lower() == "paper"
+    
+    def isLive(self):
+        return self.getBroker().getType().lower() == "live"
 
     def marketOrder(self, instrument, quantity, onClose=False, goodTillCanceled=False, allOrNone=False):
         """Submits a market order.
@@ -435,7 +442,8 @@ class BaseStrategy(object):
     """Base class for strategies. """
     def onStart(self):
         """Override (optional) to get notified when the strategy starts executing. The default implementation is empty. """
-        self.__feedThread.start()
+        if self.__feedThread:
+            self.__feedThread.start()
 
     def onFinish(self, bars):
         """Override (optional) to get notified when the strategy finished executing. The default implementation is empty.
@@ -574,7 +582,6 @@ class BaseStrategy(object):
             try:
                 bars = self.getFeed().getNextBars()
                 if bars:
-                    self.getFeed().getNewValuesEvent().emit(bars.getDateTime(), bars)
                     self.__onBars(bars.getDateTime(), bars)
             except Exception as e:
                 self.getLogger().exception(e)
