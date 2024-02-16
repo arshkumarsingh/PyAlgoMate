@@ -182,6 +182,8 @@ class LiveTradeFeed(BaseBarFeed):
                 self.__pending_subscriptions.clear()
                 logger.info("Initialization completed")
                 break
+            else:
+                logger.info(f"Found only {self.__lastBars.keys()}")
             time.sleep(1)
 
     def stop(self):

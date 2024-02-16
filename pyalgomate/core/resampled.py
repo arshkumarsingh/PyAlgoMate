@@ -103,9 +103,10 @@ class ResampledBars():
         if self.__range is None:
             self.__range = build_range(
                 dateTime, self.getFrequency())
+        if self.__grouper is None:
             self.__grouper = BarsGrouper(
                 self.__range.getBeginning(), value, self.getFrequency())
-        elif self.__range.belongs(dateTime):
+        if self.__range.belongs(dateTime):
             self.__grouper.addValue(value)
 
         barFeedFrequency = self.__barFeed.getFrequency()
