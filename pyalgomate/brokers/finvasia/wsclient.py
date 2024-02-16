@@ -6,6 +6,7 @@ import time
 import threading
 import logging
 import datetime
+import multiprocessing
 
 from NorenRestApiPy.NorenApi import NorenApi
 
@@ -100,10 +101,11 @@ class WebSocketClient:
         pass
 
 
-class WebSocketClientThreadBase(threading.Thread):
+class WebSocketClientThreadBase(multiprocessing.Process):
     def __init__(self, wsCls, *args, **kwargs):
         super(WebSocketClientThreadBase, self).__init__()
-        self.__quotes = dict()
+        self.manager = multiprocessing.Manager()
+        self.__quotes = self.manager.dict()
         self.__wsClient = None
         self.__wsCls = wsCls
         self.__args = args
@@ -115,7 +117,7 @@ class WebSocketClientThreadBase(threading.Thread):
     def waitInitialized(self, timeout):
         return self.__wsClient is not None and self.__wsClient.waitInitialized(timeout)
 
-    def run(self):
+    def start(self):
         # We create the WebSocketClient right in the thread, instead of doing so in the constructor,
         # because it has thread affinity.
         try:
@@ -132,6 +134,7 @@ class WebSocketClientThreadBase(threading.Thread):
             if self.__wsClient is not None:
                 logger.debug("Stopping websocket client")
                 self.__wsClient.stopClient()
+                self.terminate()
         except Exception as e:
             logger.error("Error stopping websocket client: %s" % e)
 
