@@ -3,7 +3,6 @@ import logging
 import six
 import traceback
 import threading
-import zmq
 
 import pyalgotrade.broker
 from pyalgotrade.broker import backtesting
@@ -52,22 +51,12 @@ class BaseStrategy(object):
 
         # It is important to dispatch broker events before feed events, specially if we're backtesting.
         self.__dispatcher.addSubject(self.__broker)
-        self.__zmq_context = None
-        self.__zmq_subscriber = None
-        self.poller = None
         self.__feedThread = None
         self.__stopped = False
         if self.isBacktest():
             self.__dispatcher.addSubject(self.__barFeed)
         else:
-            self.__zmq_context = zmq.Context()
-            self.__zmq_subscriber = self.__zmq_context.socket(zmq.SUB)
-            self.__zmq_subscriber.connect(f"tcp://127.0.0.1:5555")
-            self.__zmq_subscriber.setsockopt_string(zmq.SUBSCRIBE, "")
-            self.poller = zmq.Poller()
-            self.poller.register(self.__zmq_subscriber, zmq.POLLIN)
             self.__feedThread = threading.Thread(target=self.__subscribeFeed)
-            self.__feedThread.start()
 
         # Initialize logging.
         self.__logger = logger.getLogger(BaseStrategy.LOGGER_NAME)
@@ -447,7 +436,7 @@ class BaseStrategy(object):
     """Base class for strategies. """
     def onStart(self):
         """Override (optional) to get notified when the strategy starts executing. The default implementation is empty. """
-        pass
+        self.__feedThread.start()
 
     def onFinish(self, bars):
         """Override (optional) to get notified when the strategy finished executing. The default implementation is empty.
@@ -518,7 +507,7 @@ class BaseStrategy(object):
             for resampledBarFeed in self.__resampledBarFeeds:
                 resampledBarFeed.addBars(dateTime, bars)
         except Exception as e:
-            self.__logger.exception(f'Exception in __onBars. {e}\n\n{traceback.format_exc()}')
+            self.getLogger().exception(f'Exception in __onBars. {e}\n\n{traceback.format_exc()}')
 
         # 3: Notify that the bars were processed.
         self.__barsProcessedEvent.emit(self, bars)
@@ -537,8 +526,6 @@ class BaseStrategy(object):
 
         self.__stopped = True
         if self.__feedThread:
-            self.__zmq_subscriber.close()
-            self.__zmq_context.term()
             self.__feedThread.join()
             self.__feedThread = None
 
@@ -584,22 +571,10 @@ class BaseStrategy(object):
         return ret
 
     def __subscribeFeed(self):
-        dateTime = None
-        barDict = dict()
         while not self.__stopped:
-            socks = dict(self.poller.poll(100))
-
-            if self.__zmq_subscriber in socks and socks[self.__zmq_subscriber] == zmq.POLLIN:
-                tradeBar = BasicBarEx.from_json(self.__zmq_subscriber.recv_json())
-                if not dateTime:
-                    dateTime = tradeBar.getDateTime()
-
-                if tradeBar.getDateTime() != dateTime:
-                    self.__onBars(dateTime, bar.Bars(barDict))
-                    dateTime = None
-                    barDict = dict()
-                else:
-                    barDict[tradeBar.getInstrument()] = tradeBar
+            bars = self.getFeed().getNextBars()
+            if bars:
+                self.__onBars(bars.getDateTime(), bars)
 
 class BacktestingStrategy(BaseStrategy):
     """Base class for backtesting strategies.

@@ -267,9 +267,7 @@ class BaseOptionsGreeksStrategy(BaseStrategy):
         return fig.to_image(format='png')
 
     def onStart(self):
-        # build open orders from tradeDf
-        #self.buildOrdersFromActiveOrders()
-        pass
+        super().onStart()
 
     def displaySlippage(self, order: Order):
         orderType = order.getType()

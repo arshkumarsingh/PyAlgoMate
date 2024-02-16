@@ -6,7 +6,7 @@ import time
 import datetime
 import logging
 import threading
-import zmq
+from collections import defaultdict
 
 from NorenRestApiPy.NorenApi import NorenApi
 
@@ -43,7 +43,6 @@ class QuoteMessage(object):
     def __init__(self, eventDict, tokenMappings):
         self.__eventDict = eventDict
         self.__tokenMappings = tokenMappings
-        self.__datetime = None
 
     def __str__(self):
         return f'{self.__eventDict}'
@@ -62,15 +61,8 @@ class QuoteMessage(object):
 
     @property
     def dateTime(self):
-        if self.__datetime is None:
-            self.__datetime = datetime.datetime.fromtimestamp(int(self.__eventDict['ft'])) if self.__eventDict.get(
-                'ft', None) is not None else datetime.datetime.now()
-
-        return self.__datetime
-
-    @dateTime.setter
-    def dateTime(self, value):
-        self.__datetime = value
+        #return datetime.datetime.fromtimestamp(int(self.__eventDict['ft']))
+        return self.__eventDict["ct"]
 
     @property
     def price(self): return float(self.__eventDict.get('lp', 0))
@@ -82,7 +74,7 @@ class QuoteMessage(object):
     def openInterest(self): return float(self.__eventDict.get('oi', 0))
 
     @property
-    def seq(self): return int(self.dateTime())
+    def seq(self): return int(self.dateTime)
 
     @property
     def instrument(self): return f"{self.exchange}|{self.__tokenMappings[f'{self.exchange}|{self.scriptToken}'].split('|')[1]}"
@@ -100,7 +92,8 @@ class QuoteMessage(object):
                     bar.Frequency.TRADE,
                     {
                         "Instrument": self.instrument,
-                        "Open Interest": self.openInterest
+                        "Open Interest": self.openInterest,
+                        "Message": self.__eventDict
                     }
                 )
 
@@ -110,22 +103,18 @@ class LiveTradeFeed(BaseBarFeed):
         super(LiveTradeFeed, self).__init__(bar.Frequency.TRADE, maxLen)
         self.__api:NorenApi = api
         self.__tokenMappings = tokenMappings
+        self.__reverseTokenMappings = {value: key for key, value in tokenMappings.items()}
         self.__timeout = timeout
         self.__connectionOpened = threading.Event()
         
         for key, value in tokenMappings.items():
             self.registerDataSeries(value)
 
-        self.__lastDateTime = None
         self.__lastBars = dict()
         
         self.__wsThread = None
         self.__stopped = False
         self.__pending_subscriptions = list()
-
-        self.__zmq_context = zmq.Context()
-        self.__zmq_publisher = self.__zmq_context.socket(zmq.PUB)
-        self.__zmq_publisher.bind(f"tcp://127.0.0.1:5555")
 
     def getCurrentDateTime(self):
         return datetime.datetime.now()
@@ -138,24 +127,33 @@ class LiveTradeFeed(BaseBarFeed):
         return False
 
     def getNextBars(self):
-        return None
+        groupedQuoteMessages = defaultdict(dict)
+        for lastBar in self.__lastBars.values():
+            quoteMessage = QuoteMessage(lastBar, self.__tokenMappings)
+            groupedQuoteMessages[quoteMessage.dateTime][quoteMessage.instrument] = quoteMessage.getBar()
+
+        latestDateTime = max(groupedQuoteMessages.keys(), default=None)
+        return bar.Bars(groupedQuoteMessages[latestDateTime]) if latestDateTime is not None else None
 
     def getLastUpdatedDateTime(self):
-        return self.__lastDateTime
+        return max((QuoteMessage(lastBar, self.__tokenMappings).dateTime for lastBar in self.__lastBars.values()), default=None)
 
     def isDataFeedAlive(self, heartBeatInterval=5):
-        if self.__lastDateTime is None:
+        if self.getLastUpdatedDateTime() is None:
             return False
 
         currentDateTime = datetime.datetime.now()
-        timeSinceLastDateTime = currentDateTime - self.__lastDateTime
+        timeSinceLastDateTime = currentDateTime - self.getLastUpdatedDateTime()
         return timeSinceLastDateTime.total_seconds() <= heartBeatInterval
 
     def getApi(self):
         return self.__api
     
     def getLastBar(self, instrument) -> bar.Bar:
-        return self.__lastBars.get(instrument, None)
+        lastBarQuote = self.__lastBars.get(self.__reverseTokenMappings[instrument], None)
+        if lastBarQuote:
+            return QuoteMessage(lastBarQuote, self.__tokenMappings).getBar()
+        return None
     
     def start(self):
         if self.__wsThread is not None:
@@ -186,9 +184,6 @@ class LiveTradeFeed(BaseBarFeed):
             time.sleep(1)
 
     def stop(self):
-        self.__zmq_publisher.close()
-        self.__zmq_context.term()
-
         if self.__wsThread is not None:
             self.__api.close_websocket()
             self.__stopped = True
@@ -221,12 +216,16 @@ class LiveTradeFeed(BaseBarFeed):
         logger.warning("Unknown event: %s." % event)
 
     def onQuoteUpdate(self, message):
-        logger.debug(message)
-        quoteMessage = QuoteMessage(message, self.__tokenMappings)
-        tradeBar = quoteMessage.getBar()
-        self.__lastBars[quoteMessage.instrument] = tradeBar
-        self.__zmq_publisher.send_json(tradeBar.to_json())
-        self.__lastDateTime = tradeBar.getDateTime()
+        key = message['e'] + '|' + message['tk']
+        ct = datetime.datetime.now().replace(microsecond=0)
+        message['ct'] = ct
+
+        if key in self.__lastBars:
+            symbolInfo =  self.__lastBars[key]
+            symbolInfo.update(message)
+            self.__lastBars[key] = symbolInfo
+        else:
+            self.__lastBars[key] = message
 
     def onOpened(self):
         logger.info("Websocket connected")
