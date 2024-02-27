@@ -6,6 +6,7 @@ import time
 import threading
 import logging
 import datetime
+import queue
 
 from NorenRestApiPy.NorenApi import NorenApi
 
@@ -22,9 +23,13 @@ class WebSocketClient:
         self.__pending_subscriptions = list()
         self.__connected = False
         self.__connectionOpened = threading.Event()
+        self.__queue = queue.Queue(maxsize=10000)
 
     def getQuotes(self):
         return self.__quotes
+    
+    def getQueue(self):
+        return self.__queue
 
     def getLastQuoteDateTime(self):
         return self.__lastQuoteDateTime
@@ -101,6 +106,15 @@ class WebSocketClient:
             self.__quotes[key] = symbolInfo
         else:
             self.__quotes[key] = message
+        
+        while True:
+            try:
+                self.__queue.put_nowait(message)
+            except queue.Full:
+                logger.info('Queue full')
+                time.sleep(0.01)
+            else:
+                break
 
     def onOrderBookUpdate(self, message):
         pass

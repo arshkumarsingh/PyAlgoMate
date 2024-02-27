@@ -4,6 +4,7 @@
 
 import datetime
 import logging
+import queue
 
 from pyalgotrade import bar
 from pyalgomate.barfeed import BaseBarFeed
@@ -129,7 +130,7 @@ class LiveTradeFeed(BaseBarFeed):
         self.__wsClient: WebSocketClient = None
         self.__stopped = False
         self.__nextBarsTime = None
-        self.__lastUpdateTime = None
+        self.__nextBars = queue.Queue()
 
     def getApi(self):
         return self.__api
@@ -160,22 +161,15 @@ class LiveTradeFeed(BaseBarFeed):
         return None
 
     def getNextBars(self):
-        def getBar(lastBar):
-            bar = QuoteMessage(lastBar, self.__channels).getBar()
-            return bar.getInstrument(), bar
-
-        bars = None
-        lastQuoteDateTime = self.__wsClient.getLastQuoteDateTime()
-        if self.__lastUpdateTime != lastQuoteDateTime:
-            bars = bar.Bars({
-                instrument: bar
-                for lastBar in self.__wsClient.getQuotes().values()
-                if lastQuoteDateTime == lastBar.get('ft')
-                for instrument, bar in [getBar(lastBar)]
-            })
-            self.__nextBarsTime = datetime.datetime.now()
-            self.__lastUpdateTime = lastQuoteDateTime
-        return bars
+        try:
+            nextBar = self.__nextBars.get_nowait()
+            quoteBar = QuoteMessage(nextBar, self.__channels).getBar()
+            self.__nextBarsTime = quoteBar.getDateTime()
+            return bar.Bars({ quoteBar.getInstrument() : quoteBar })
+        except queue.Empty:
+            pass
+        
+        return None
 
     def peekDateTime(self):
         # Return None since this is a realtime subject.
@@ -193,11 +187,16 @@ class LiveTradeFeed(BaseBarFeed):
             raise Exception("Initialization failed")
 
     def dispatch(self):
-        # Note that we may return True even if we didn't dispatch any Bar
-        # event.
         ret = False
+        try:
+            quote = self.__wsClient.getQueue().get_nowait()
+            self.__nextBars.put(quote)
+        except queue.Empty:
+            pass
+
         if super(LiveTradeFeed, self).dispatch():
             ret = True
+
         return ret
 
     # This should not raise.
@@ -232,9 +231,9 @@ class LiveTradeFeed(BaseBarFeed):
         return self.__nextBarsTime
     
     def isDataFeedAlive(self, heartBeatInterval=5):
-        if self.__lastUpdateTime is None:
+        if self.getLastUpdatedDateTime() is None:
             return False
 
         currentDateTime = datetime.datetime.now()
-        timeSinceLastDateTime = currentDateTime - self.__lastUpdateTime
+        timeSinceLastDateTime = currentDateTime - self.getLastUpdatedDateTime()
         return timeSinceLastDateTime.total_seconds() <= heartBeatInterval
